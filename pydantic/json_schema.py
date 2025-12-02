@@ -2275,28 +2275,38 @@ class GenerateJsonSchema:
             module_qualname_occurrence_mode,
         ]
 
-        # Check for custom json_schema_name from config
+        # Extract custom name configuration
+        # Both json_schema_name and json_schema_name_generator are optional configuration options that
+        # allow users to customize the name used in JSON schema definitions. If neither is provided,
+        # or if they produce invalid values, we gracefully fall back to default name generation.
         custom_names: list[DefsRef] = []
         cls = self._core_ref_to_class.get(core_ref)
         if cls is not None:
             config = getattr(cls, 'model_config', None) or getattr(cls, '__pydantic_config__', None)
             if config:
-                # Explicit json_schema_name takes precedence
+                # Explicit json_schema_name takes precedence over json_schema_name_generator
                 if json_schema_name := config.get('json_schema_name'):
+                    # Empty strings or whitespace-only strings are treated as "not configured" and fall back to defaults.
+                    # This is intentional - we don't raise errors for invalid configs to maintain graceful degradation.
                     if isinstance(json_schema_name, str) and json_schema_name.strip():
                         custom_name = DefsRef(self.normalize_name(json_schema_name))
                         custom_name_mode = DefsRef(f'{custom_name}-{mode_title}')
                         custom_names = [custom_name, custom_name_mode]
-                # Otherwise try json_schema_name_generator
+                # Otherwise try json_schema_name_generator if json_schema_name is not set
                 elif json_schema_name_generator := config.get('json_schema_name_generator'):
                     try:
                         generated_name = json_schema_name_generator(cls)
+                        # Same validation as json_schema_name: empty/whitespace-only strings fall back to defaults.
+                        # Non-string return values are also treated as invalid and fall back gracefully.
                         if generated_name and isinstance(generated_name, str) and generated_name.strip():
                             custom_name = DefsRef(self.normalize_name(generated_name))
                             custom_name_mode = DefsRef(f'{custom_name}-{mode_title}')
                             custom_names = [custom_name, custom_name_mode]
                     except Exception:
-                        # If the generator fails, fall back to default behavior
+                        # If the generator function raises any exception (e.g., for unsupported types like generics),
+                        # we silently fall back to default name generation rather than failing schema generation.
+                        # This is intentional to maintain robustness - the collision detection will catch any
+                        # issues with duplicate names that result from falling back to defaults.
                         pass
 
         # Prepend custom names to priority list if present
@@ -2536,7 +2546,9 @@ class GenerateJsonSchema:
         - Same model in different modes (validation vs serialization)
         - Same generic model with different type parameters (handled by mode suffixes)
         """
-        # Build maps of custom and default names to models
+        # Build maps to detect name collisions between:
+        # 1. Different models using the same custom name (json_schema_name or json_schema_name_generator)
+        # 2. Custom names that collide with default-generated names from other models
         custom_names_to_models: dict[DefsRef, list[tuple[type[Any], JsonSchemaCustomNameSource]]] = defaultdict(list)
         default_names_to_models: dict[DefsRef, set[int]] = defaultdict(set)  # Use set of class IDs
 
@@ -2551,7 +2563,6 @@ class GenerateJsonSchema:
             if cls is None:
                 continue
 
-            # Determine if this model has custom names
             config = getattr(cls, 'model_config', None) or getattr(cls, '__pydantic_config__', None)
             has_custom_name = False
             custom_name_source: JsonSchemaCustomNameSource | None = None
@@ -2564,10 +2575,9 @@ class GenerateJsonSchema:
                     has_custom_name = True
                     custom_name_source = 'json_schema_name_generator'
 
-            # Get the origin class for generics
+            # Get the origin class for generics to avoid treating generic parameterizations as different models
             origin_cls = getattr(cls, '__origin__', cls)
 
-            # Separate custom names from default names
             if has_custom_name and custom_name_source and len(prioritized_choices) >= 2:
                 # First two are custom (base and mode-suffixed), rest are defaults
                 for i, name in enumerate(prioritized_choices):
@@ -2589,7 +2599,7 @@ class GenerateJsonSchema:
                         continue
                     default_names_to_models[name].add(id(origin_cls))
 
-        # Check for collisions among custom names
+        # Detect collisions when multiple different models specify the same custom name
         for custom_name, models_with_source in custom_names_to_models.items():
             # Deduplicate by class ID - we only care if DIFFERENT classes have the same name
             unique_classes: dict[int, tuple[type[Any], JsonSchemaCustomNameSource]] = {}
@@ -2624,7 +2634,6 @@ class GenerateJsonSchema:
                 conflicting_default_class_ids = default_class_ids - custom_class_ids
 
                 if conflicting_default_class_ids:
-                    # Build error message showing both custom and default models
                     unique_custom_classes: dict[int, tuple[type[Any], JsonSchemaCustomNameSource]] = {}
                     for cls, source in models_with_source:
                         class_id = id(cls)
