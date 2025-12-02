@@ -46,10 +46,58 @@ class ConfigDict(TypedDict, total=False):
     """A callable that takes a field's name and info and returns title for it. Defaults to `None`."""
 
     json_schema_name: str | None
-    """Override the name used in JSON schema $defs. Takes precedence over json_schema_name_generator."""
+    """Override the name used for this model in JSON Schema `$defs`.
+
+    This allows you to customize the reference name that appears in JSON Schema definitions,
+    which is particularly useful when you have models with the same name from different modules
+    or want more meaningful names in your OpenAPI documentation.
+
+    Takes precedence over `json_schema_name_generator` if both are set.
+
+    Empty strings or whitespace-only values are treated as not configured and fall back to default naming.
+
+    Example:
+        ```python
+        from pydantic import BaseModel, ConfigDict
+
+        class User(BaseModel):
+            model_config = ConfigDict(json_schema_name='CustomUserName')
+            name: str
+        ```
+
+    Note:
+        Each model must have a unique `json_schema_name`. If multiple models use the same custom name,
+        a `PydanticUserError` will be raised during schema generation.
+    """
 
     json_schema_name_generator: Callable[[type], str] | None
-    """A callable that takes a model class and generates the JSON schema name."""
+    """A callable that dynamically generates the JSON schema name for this model.
+
+    This function receives the model class as an argument and should return a string to use
+    as the JSON Schema definition name. This is useful for systematic naming across multiple models.
+
+    The generator is only used if `json_schema_name` is not set.
+
+    If the generator returns `None`, an empty string, or a non-string value, the default naming
+    will be used. If the generator raises an exception, it will be caught and default naming
+    will be used gracefully.
+
+    Example:
+        ```python
+        from pydantic import BaseModel, ConfigDict
+
+        def name_generator(model: type) -> str:
+            return f"{model.__module__.split('.')[-1]}_{model.__name__}"
+
+        class User(BaseModel):
+            model_config = ConfigDict(json_schema_name_generator=name_generator)
+            name: str
+        ```
+
+    Note:
+        The same uniqueness requirement applies as with `json_schema_name` - each generated name
+        must be unique across all models in the schema.
+    """
 
     str_to_lower: bool
     """Whether to convert all characters to lowercase for str types. Defaults to `False`."""
