@@ -54,6 +54,8 @@ class ConfigWrapper:
     alias_generator: Callable[[str], str] | AliasGenerator | None
     model_title_generator: Callable[[type], str] | None
     field_title_generator: Callable[[str, FieldInfo | ComputedFieldInfo], str] | None
+    json_schema_name: str | None
+    json_schema_name_generator: Callable[[type], str] | None
     ignored_types: tuple[type, ...]
     allow_inf_nan: bool
     json_schema_extra: JsonDict | JsonSchemaExtraCallable | None
@@ -284,6 +286,8 @@ config_defaults = ConfigDict(
     alias_generator=None,
     model_title_generator=None,
     field_title_generator=None,
+    json_schema_name=None,
+    json_schema_name_generator=None,
     ignored_types=(),
     allow_inf_nan=True,
     json_schema_extra=None,

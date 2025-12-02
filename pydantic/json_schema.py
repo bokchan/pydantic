@@ -306,6 +306,17 @@ class GenerateJsonSchema:
         # store the error raised and re-throw it if we end up needing that def
         self._core_defs_invalid_for_json_schema: dict[DefsRef, PydanticInvalidForJsonSchema] = {}
 
+        # Store mapping from core_ref to class for accessing config in get_defs_ref
+        self._core_ref_to_class: dict[CoreRef, type[Any]] = {}
+
+        # Track which DefsRef values came from explicit custom names (json_schema_name or json_schema_name_generator)
+        # so we can raise errors on collisions instead of silently falling back
+        # Maps DefsRef -> list of (class, source) tuples to track all models using each custom name
+        self._custom_name_defs_refs: dict[DefsRef, list[tuple[type[Any], str]]] = defaultdict(list)
+
+        # Map from the unique DefsRef to its core_ref for collision detection
+        self._defs_ref_to_core_ref: dict[DefsRef, CoreRef] = {}
+
         # This changes to True after generating a schema, to prevent issues caused by accidental reuse
         # of a single instance of a schema generator
         self._used = False
@@ -1605,6 +1616,11 @@ class GenerateJsonSchema:
         cls = cast('type[BaseModel]', schema['cls'])
         config = cls.model_config
 
+        # Store the class for use in get_defs_ref
+        if 'ref' in schema:
+            core_ref = CoreRef(schema['ref'])  # type: ignore[typeddict-item]
+            self._core_ref_to_class[core_ref] = cls
+
         with self._config_wrapper_stack.push(config):
             json_schema = self.generate_inner(schema['schema'])
 
@@ -1806,6 +1822,11 @@ class GenerateJsonSchema:
 
         cls = schema['cls']
         config: ConfigDict = getattr(cls, '__pydantic_config__', cast('ConfigDict', {}))
+
+        # Store the class for use in get_defs_ref
+        if 'ref' in schema:
+            core_ref = CoreRef(schema['ref'])  # type: ignore[typeddict-item]
+            self._core_ref_to_class[core_ref] = cls
 
         with self._config_wrapper_stack.push(config):
             json_schema = self.generate_inner(schema['schema']).copy()
@@ -2242,7 +2263,8 @@ class GenerateJsonSchema:
         module_qualname_occurrence = DefsRef(f'{module_qualname}__{occurrence_index}')
         module_qualname_occurrence_mode = DefsRef(f'{module_qualname_mode}__{occurrence_index}')
 
-        self._prioritized_defsref_choices[module_qualname_occurrence_mode] = [
+        # Build default priority list
+        prioritized_choices = [
             name,
             name_mode,
             module_qualname,
@@ -2250,6 +2272,45 @@ class GenerateJsonSchema:
             module_qualname_occurrence,
             module_qualname_occurrence_mode,
         ]
+
+        # Check for custom json_schema_name from config
+        custom_names: list[DefsRef] = []
+        custom_name_source: str | None = None
+        cls = self._core_ref_to_class.get(core_ref)
+        if cls is not None:
+            config = getattr(cls, 'model_config', None) or getattr(cls, '__pydantic_config__', None)
+            if config:
+                # Explicit json_schema_name takes precedence
+                if json_schema_name := config.get('json_schema_name'):
+                    if isinstance(json_schema_name, str) and json_schema_name.strip():
+                        custom_name = DefsRef(self.normalize_name(json_schema_name))
+                        custom_name_mode = DefsRef(f'{custom_name}-{mode_title}')
+                        custom_names = [custom_name, custom_name_mode]
+                        custom_name_source = 'json_schema_name'
+                # Otherwise try json_schema_name_generator
+                elif json_schema_name_generator := config.get('json_schema_name_generator'):
+                    try:
+                        generated_name = json_schema_name_generator(cls)
+                        if generated_name and isinstance(generated_name, str) and generated_name.strip():
+                            custom_name = DefsRef(self.normalize_name(generated_name))
+                            custom_name_mode = DefsRef(f'{custom_name}-{mode_title}')
+                            custom_names = [custom_name, custom_name_mode]
+                            custom_name_source = 'json_schema_name_generator'
+                    except Exception:
+                        # If the generator fails, fall back to default behavior
+                        pass
+
+        # Track custom names for collision detection
+        if custom_names and custom_name_source and cls:
+            for custom_name in custom_names:
+                self._custom_name_defs_refs[custom_name].append((cls, custom_name_source))
+
+        # Prepend custom names to priority list if present
+        if custom_names:
+            prioritized_choices = custom_names + prioritized_choices
+
+        self._prioritized_defsref_choices[module_qualname_occurrence_mode] = prioritized_choices
+        self._defs_ref_to_core_ref[module_qualname_occurrence_mode] = core_ref
 
         return module_qualname_occurrence_mode
 
@@ -2473,12 +2534,146 @@ class GenerateJsonSchema:
             return None
         return f'{detail} [{kind}]'
 
+    def _check_custom_name_collisions(self) -> None:
+        """Check if any custom names (from json_schema_name or json_schema_name_generator) have collisions.
+
+        If multiple DIFFERENT models specify the same custom name, raise a PydanticUserError to inform the developer
+        that they need to choose unique names. Also checks if a custom name collides with a default-generated name
+        from another model. We don't raise errors for:
+        - Same model in different modes (validation vs serialization)
+        - Same generic model with different type parameters (handled by mode suffixes)
+        """
+        # Build maps of custom and default names to models
+        custom_names_to_models: dict[str, list[tuple[type[Any], str]]] = defaultdict(list)
+        default_names_to_models: dict[str, set[int]] = defaultdict(set)  # Use set of class IDs
+
+        for unique_defs_ref, prioritized_choices in self._prioritized_defsref_choices.items():
+            core_ref = self._defs_ref_to_core_ref.get(unique_defs_ref)
+            if core_ref is None:
+                continue
+
+            cls = self._core_ref_to_class.get(core_ref)
+            if cls is None:
+                continue
+
+            # Determine if this model has custom names
+            config = getattr(cls, 'model_config', None) or getattr(cls, '__pydantic_config__', None)
+            has_custom_name = False
+            custom_name_source: str | None = None
+
+            if config:
+                if config.get('json_schema_name'):
+                    has_custom_name = True
+                    custom_name_source = 'json_schema_name'
+                elif config.get('json_schema_name_generator'):
+                    has_custom_name = True
+                    custom_name_source = 'json_schema_name_generator'
+
+            # Get the origin class for generics
+            origin_cls = getattr(cls, '__origin__', cls)
+
+            # Separate custom names from default names
+            if has_custom_name and custom_name_source and len(prioritized_choices) >= 2:
+                # First two are custom (base and mode-suffixed), rest are defaults
+                for i, name in enumerate(prioritized_choices):
+                    # Skip mode-suffixed names
+                    if name.endswith(('-Input', '-Output')):
+                        continue
+
+                    if i < 2:
+                        # This is a custom name
+                        custom_names_to_models[name].append((origin_cls, custom_name_source))
+                    else:
+                        # This is a default name
+                        default_names_to_models[name].add(id(origin_cls))
+            else:
+                # All are defaults
+                for name in prioritized_choices:
+                    # Skip mode-suffixed names
+                    if name.endswith(('-Input', '-Output')):
+                        continue
+                    default_names_to_models[name].add(id(origin_cls))
+
+        # Check for collisions among custom names
+        for custom_name, models_with_source in custom_names_to_models.items():
+            # Deduplicate by class ID - we only care if DIFFERENT classes have the same name
+            unique_classes: dict[int, tuple[type[Any], str]] = {}
+            for cls, source in models_with_source:
+                class_id = id(cls)
+                if class_id not in unique_classes:
+                    unique_classes[class_id] = (cls, source)
+
+            if len(unique_classes) > 1:
+                # We have a real collision - different classes using the same custom name
+                model_descriptions = []
+                for cls, source in unique_classes.values():
+                    model_name = f'{cls.__module__}.{cls.__qualname__}'
+                    model_descriptions.append(f'  - {model_name} (via {source})')
+
+                models_list = '\n'.join(model_descriptions)
+                raise PydanticUserError(
+                    f'Multiple models have the same JSON schema name "{custom_name}". '
+                    f'Each model must have a unique json_schema_name or json_schema_name_generator result. '
+                    f'Conflicting models:\n{models_list}',
+                    code='custom-json-schema',
+                )
+
+        # Check for collisions between custom names and default names
+        for custom_name, models_with_source in custom_names_to_models.items():
+            if custom_name in default_names_to_models:
+                # Deduplicate custom models by class ID
+                custom_class_ids = {id(cls) for cls, _ in models_with_source}
+                default_class_ids = default_names_to_models[custom_name]
+
+                # Check if any default model is different from all custom models
+                conflicting_default_class_ids = default_class_ids - custom_class_ids
+
+                if conflicting_default_class_ids:
+                    # Build error message showing both custom and default models
+                    unique_custom_classes: dict[int, tuple[type[Any], str]] = {}
+                    for cls, source in models_with_source:
+                        class_id = id(cls)
+                        if class_id not in unique_custom_classes:
+                            unique_custom_classes[class_id] = (cls, source)
+
+                    custom_models_desc = '\n'.join(
+                        f'  - {cls.__module__}.{cls.__qualname__} (via {source})'
+                        for cls, source in unique_custom_classes.values()
+                    )
+
+                    # Find the actual classes for default models
+                    default_models_list: list[str] = []
+                    for unique_defs_ref_iter in self._prioritized_defsref_choices.keys():
+                        core_ref_iter = self._defs_ref_to_core_ref.get(unique_defs_ref_iter)
+                        if core_ref_iter is None:
+                            continue
+                        cls_iter = self._core_ref_to_class.get(core_ref_iter)
+                        if cls_iter:
+                            origin_cls_iter = getattr(cls_iter, '__origin__', cls_iter)
+                            if id(origin_cls_iter) in conflicting_default_class_ids:
+                                model_name = f'{origin_cls_iter.__module__}.{origin_cls_iter.__qualname__}'
+                                if model_name not in [d.split(' ')[1] for d in default_models_list]:
+                                    default_models_list.append(f'  - {model_name} (via default name)')
+
+                    default_models_desc = '\n'.join(default_models_list)
+
+                    raise PydanticUserError(
+                        f'Custom JSON schema name "{custom_name}" collides with the default name for another model. '
+                        f'Each model must have a unique json_schema_name or json_schema_name_generator result. '
+                        f'Models with custom name:\n{custom_models_desc}\n'
+                        f'Models with default name:\n{default_models_desc}',
+                        code='custom-json-schema',
+                    )
+
     def _build_definitions_remapping(self) -> _DefinitionsRemapping:
         defs_to_json: dict[DefsRef, JsonRef] = {}
         for defs_refs in self._prioritized_defsref_choices.values():
             for defs_ref in defs_refs:
                 json_ref = JsonRef(self.ref_template.format(model=defs_ref))
                 defs_to_json[defs_ref] = json_ref
+
+        # Check for collisions in custom names before building remapping
+        self._check_custom_name_collisions()
 
         return _DefinitionsRemapping.from_prioritized_choices(
             self._prioritized_defsref_choices, defs_to_json, self.definitions

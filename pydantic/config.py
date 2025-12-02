@@ -45,6 +45,12 @@ class ConfigDict(TypedDict, total=False):
     field_title_generator: Callable[[str, FieldInfo | ComputedFieldInfo], str] | None
     """A callable that takes a field's name and info and returns title for it. Defaults to `None`."""
 
+    json_schema_name: str | None
+    """Override the name used in JSON schema $defs. Takes precedence over json_schema_name_generator."""
+
+    json_schema_name_generator: Callable[[type], str] | None
+    """A callable that takes a model class and generates the JSON schema name."""
+
     str_to_lower: bool
     """Whether to convert all characters to lowercase for str types. Defaults to `False`."""
 
