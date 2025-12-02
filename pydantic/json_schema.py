@@ -309,14 +309,6 @@ class GenerateJsonSchema:
         # Store mapping from core_ref to class for accessing config in get_defs_ref
         self._core_ref_to_class: dict[CoreRef, type[Any]] = {}
 
-        # Track which DefsRef values came from explicit custom names (json_schema_name or json_schema_name_generator)
-        # so we can raise errors on collisions instead of silently falling back
-        # Maps DefsRef -> list of (class, source) tuples to track all models using each custom name
-        self._custom_name_defs_refs: dict[DefsRef, list[tuple[type[Any], str]]] = defaultdict(list)
-
-        # Map from the unique DefsRef to its core_ref for collision detection
-        self._defs_ref_to_core_ref: dict[DefsRef, CoreRef] = {}
-
         # This changes to True after generating a schema, to prevent issues caused by accidental reuse
         # of a single instance of a schema generator
         self._used = False
@@ -2275,7 +2267,6 @@ class GenerateJsonSchema:
 
         # Check for custom json_schema_name from config
         custom_names: list[DefsRef] = []
-        custom_name_source: str | None = None
         cls = self._core_ref_to_class.get(core_ref)
         if cls is not None:
             config = getattr(cls, 'model_config', None) or getattr(cls, '__pydantic_config__', None)
@@ -2286,7 +2277,6 @@ class GenerateJsonSchema:
                         custom_name = DefsRef(self.normalize_name(json_schema_name))
                         custom_name_mode = DefsRef(f'{custom_name}-{mode_title}')
                         custom_names = [custom_name, custom_name_mode]
-                        custom_name_source = 'json_schema_name'
                 # Otherwise try json_schema_name_generator
                 elif json_schema_name_generator := config.get('json_schema_name_generator'):
                     try:
@@ -2295,22 +2285,15 @@ class GenerateJsonSchema:
                             custom_name = DefsRef(self.normalize_name(generated_name))
                             custom_name_mode = DefsRef(f'{custom_name}-{mode_title}')
                             custom_names = [custom_name, custom_name_mode]
-                            custom_name_source = 'json_schema_name_generator'
                     except Exception:
                         # If the generator fails, fall back to default behavior
                         pass
-
-        # Track custom names for collision detection
-        if custom_names and custom_name_source and cls:
-            for custom_name in custom_names:
-                self._custom_name_defs_refs[custom_name].append((cls, custom_name_source))
 
         # Prepend custom names to priority list if present
         if custom_names:
             prioritized_choices = custom_names + prioritized_choices
 
         self._prioritized_defsref_choices[module_qualname_occurrence_mode] = prioritized_choices
-        self._defs_ref_to_core_ref[module_qualname_occurrence_mode] = core_ref
 
         return module_qualname_occurrence_mode
 
@@ -2548,10 +2531,12 @@ class GenerateJsonSchema:
         default_names_to_models: dict[str, set[int]] = defaultdict(set)  # Use set of class IDs
 
         for unique_defs_ref, prioritized_choices in self._prioritized_defsref_choices.items():
-            core_ref = self._defs_ref_to_core_ref.get(unique_defs_ref)
-            if core_ref is None:
+            # Use existing defs_to_core_refs to get the CoreModeRef
+            core_mode_ref = self.defs_to_core_refs.get(unique_defs_ref)
+            if core_mode_ref is None:
                 continue
 
+            core_ref, mode = core_mode_ref
             cls = self._core_ref_to_class.get(core_ref)
             if cls is None:
                 continue
@@ -2644,9 +2629,10 @@ class GenerateJsonSchema:
                     # Find the actual classes for default models
                     default_models_list: list[str] = []
                     for unique_defs_ref_iter in self._prioritized_defsref_choices.keys():
-                        core_ref_iter = self._defs_ref_to_core_ref.get(unique_defs_ref_iter)
-                        if core_ref_iter is None:
+                        core_mode_ref_iter = self.defs_to_core_refs.get(unique_defs_ref_iter)
+                        if core_mode_ref_iter is None:
                             continue
+                        core_ref_iter, _ = core_mode_ref_iter
                         cls_iter = self._core_ref_to_class.get(core_ref_iter)
                         if cls_iter:
                             origin_cls_iter = getattr(cls_iter, '__origin__', cls_iter)
