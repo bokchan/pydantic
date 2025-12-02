@@ -97,6 +97,16 @@ See [`GenerateJsonSchema.render_warning_message`][pydantic.json_schema.GenerateJ
 for more details.
 """
 
+JsonSchemaCustomNameSource = Literal['json_schema_name', 'json_schema_name_generator']
+"""
+A type alias representing the source of a custom JSON schema name.
+
+This indicates which configuration option was used to specify a custom name for a model in the JSON schema:
+
+- `'json_schema_name'`: The name was set via the `json_schema_name` config option.
+- `'json_schema_name_generator'`: The name was generated via the `json_schema_name_generator` config option.
+"""
+
 
 class PydanticJsonSchemaWarning(UserWarning):
     """This class is used to emit warnings produced during JSON schema generation.
@@ -2527,8 +2537,8 @@ class GenerateJsonSchema:
         - Same generic model with different type parameters (handled by mode suffixes)
         """
         # Build maps of custom and default names to models
-        custom_names_to_models: dict[str, list[tuple[type[Any], str]]] = defaultdict(list)
-        default_names_to_models: dict[str, set[int]] = defaultdict(set)  # Use set of class IDs
+        custom_names_to_models: dict[DefsRef, list[tuple[type[Any], JsonSchemaCustomNameSource]]] = defaultdict(list)
+        default_names_to_models: dict[DefsRef, set[int]] = defaultdict(set)  # Use set of class IDs
 
         for unique_defs_ref, prioritized_choices in self._prioritized_defsref_choices.items():
             # Use existing defs_to_core_refs to get the CoreModeRef
@@ -2544,7 +2554,7 @@ class GenerateJsonSchema:
             # Determine if this model has custom names
             config = getattr(cls, 'model_config', None) or getattr(cls, '__pydantic_config__', None)
             has_custom_name = False
-            custom_name_source: str | None = None
+            custom_name_source: JsonSchemaCustomNameSource | None = None
 
             if config:
                 if config.get('json_schema_name'):
@@ -2582,7 +2592,7 @@ class GenerateJsonSchema:
         # Check for collisions among custom names
         for custom_name, models_with_source in custom_names_to_models.items():
             # Deduplicate by class ID - we only care if DIFFERENT classes have the same name
-            unique_classes: dict[int, tuple[type[Any], str]] = {}
+            unique_classes: dict[int, tuple[type[Any], JsonSchemaCustomNameSource]] = {}
             for cls, source in models_with_source:
                 class_id = id(cls)
                 if class_id not in unique_classes:
@@ -2615,7 +2625,7 @@ class GenerateJsonSchema:
 
                 if conflicting_default_class_ids:
                     # Build error message showing both custom and default models
-                    unique_custom_classes: dict[int, tuple[type[Any], str]] = {}
+                    unique_custom_classes: dict[int, tuple[type[Any], JsonSchemaCustomNameSource]] = {}
                     for cls, source in models_with_source:
                         class_id = id(cls)
                         if class_id not in unique_custom_classes:
