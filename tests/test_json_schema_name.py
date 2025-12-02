@@ -1,7 +1,7 @@
 """Tests for json_schema_name and json_schema_name_generator config options."""
 
 import re
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, Union
 
 import pytest
 
@@ -225,7 +225,7 @@ def test_json_schema_name_empty_string():
 def test_json_schema_name_generator_returns_none():
     """Test behavior when json_schema_name_generator returns None."""
 
-    def conditional_namer(model: type) -> str | None:
+    def conditional_namer(model: type) -> Union[str, None]:
         if model.__name__.startswith('Custom'):
             return f'Named{model.__name__}'
         return None
