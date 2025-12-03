@@ -97,6 +97,13 @@ See [`GenerateJsonSchema.render_warning_message`][pydantic.json_schema.GenerateJ
 for more details.
 """
 
+# NOTE: The TypeAlias is only used in the _check_custom_name_collisions function to provide more convenient
+# type annotation
+# However it is not allowed to declare a TypeAlias at function scope.
+# The alternative is to add the annotation inline, e.g.:
+# custom_names_to_models: dict[
+#     DefsRef, list[tuple[type[Any], Literal['json_schema_name', 'json_schema_name_generator']]]
+# ] = defaultdict(list)
 JsonSchemaCustomNameSource = Literal['json_schema_name', 'json_schema_name_generator']
 """
 A type alias representing the source of a custom JSON schema name.
